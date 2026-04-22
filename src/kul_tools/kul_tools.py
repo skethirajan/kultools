@@ -62,11 +62,11 @@ class KulTools:
 
     def identify_hpc_cluster(self):
         path_home = os.environ['HOME']
+        
         if path_home.startswith('/global/homes'):
-            if os.path.exists('/global/project/projectdirs'):
-                host_name = 'cori'
-            else:
+            if os.path.exists('/global/cfs/cdirs/'):
                 host_name = 'perlmutter'
+                
         elif path_home.startswith('/home/'):
             if 'SLURM_SUBMIT_HOST' in os.environ.keys():
                 if os.environ['SLURM_SUBMIT_HOST']=='hpc1':
@@ -78,6 +78,7 @@ class KulTools:
             elif 'NREL_CLUSTER' in os.environ.keys():
                 if os.environ['NREL_CLUSTER']=='kestrel':  # more robust check and independent of SLURM env variables
                     host_name = 'kestrel'
+                    
         elif path_home.startswith('/Users/'):
             host_name = 'local'
         elif path_home.startswith('/home1/'):
@@ -111,13 +112,19 @@ class KulTools:
             os.environ['VASP_COMMAND']='NTASKS=`echo $SLURM_TASKS_PER_NODE|tr \'(\' \' \'|awk \'{print $1}\'`; NNODES=`scontrol show hostnames $SLURM_JOB_NODELIST|wc -l`; NCPU=`echo " $NTASKS * $NNODES " | bc`; echo "num_cpu=" $NCPU; $(which mpirun) --map-by core --display-map --report-bindings --mca btl_openib_allow_ib true --mca btl_openib_if_include mlx5_0:1 --mca btl_openib_warn_nonexistent_if 0 --mca btl_openib_warn_no_device_params_found 0 --mca pml ob1 --mca btl openib,self,vader --mca mpi_cuda_support 0 -np $NCPU %s | tee -a op.vasp' % vasp_exe
             print(os.environ['VASP_COMMAND'])
 
-        elif self.hpc == 'cori':
-            os.environ['VASP_PP_PATH']='/global/homes/a/ark245/pseudopotentials/PBE54'
+        elif self.hpc == 'perlmutter':
             if self.gamma_only:
                 vasp_exe = 'vasp_gam'
             else:
                 vasp_exe = 'vasp_std'
-            os.environ['VASP_COMMAND']='NTASKS=`echo $SLURM_TASKS_PER_NODE|tr \'(\' \' \'|awk \'{print $1}\'`; NNODES=`scontrol show hostnames $SLURM_JOB_NODELIST|wc -l`; NCPU=`echo " $NTASKS * $NNODES " | bc`; echo "num_cpu=" $NCPU; srun -n $NCPU %s | tee -a op.vasp' % vasp_exe
+            
+            os.environ['VASP_PP_PATH']="/global/cfs/cdirs/m3548/pseudopotentials/PBE54/"
+            
+            if os.environ.get("SLURM_JOB_GPUS", None) is not None and len(list(map(int, os.environ["SLURM_JOB_GPUS"].split(',')))) > 0: # GPU job on perlmutter
+                os.environ["ASE_VASP_COMMAND"] = 'source ~/.bashrc; conda activate mace; module load vasp-tpc/6.4.2-gpu; srun --ntasks=$SLURM_NTASKS --gpus=$SLURM_GPUS --cpus-per-task=$SLURM_CPUS_PER_TASK --cpu-bind=cores --gpu-bind=none %s & > vasp.out 2> vasp.err' % vasp_exe
+            else:  # CPU-only job on perlmutter
+                os.environ["ASE_VASP_COMMAND"] = 'source ~/.bashrc; conda activate mace; module load vasp-tpc/6.4.2-cpu; srun --ntasks=$SLURM_NTASKS --cpus-per-task=$SLURM_CPUS_PER_TASK --cpu-bind=cores %s & > vasp.out 2> vasp.err' % vasp_exe
+        
         elif self.hpc == 'stampede':
             os.environ['VASP_PP_PATH']='/home1/05364/ark245/pseudopotentials/PBE54'
             if self.gamma_only:
@@ -125,12 +132,14 @@ class KulTools:
             else:
                 vasp_exe = 'vasp_std_vtst'
             os.environ['VASP_COMMAND']='module load vasp/5.4.4; export OMP_NUM_THREADS=1;rm op.vasp; mpirun -np $SLURM_NTASKS %s | tee op.vasp' % vasp_exe
+        
         elif self.hpc == "bridges2":
             print(os.environ["HOSTNAME"])
             os.environ["VASP_PP_PATH"] = "/jet/home/rgoel/uo2/vasp_PP"
             os.environ[
                 "ASE_VASP_COMMAND"
             ] = 'mpirun -np $SLURM_NTASKS /opt/packages/VASP/VASP5/PGI/vasp_std'
+        
         elif self.hpc == 'local':
             os.environ['VASP_PP_PATH']='local_vasp_pp'
             if self.gamma_only:
@@ -138,6 +147,7 @@ class KulTools:
             else:
                 vasp_exe = 'vasp_std'
             os.environ['VASP_COMMAND']='local_%s' % vasp_exe
+        
         elif self.hpc == 'kestrel':
             if self.gamma_only:
                 vasp_exe = 'vasp_gam'
@@ -147,15 +157,17 @@ class KulTools:
             os.environ[
                 "ASE_VASP_COMMAND"
             ] = 'source ~/.bashrc; conda activate llnl_base; module load vasp/6.4.2_openMP; srun %s &> out' %vasp_exe
+        
         else:
             if (os.environ.get('VASP_PP_PATH', None) is None) or ((os.environ.get('VASP_COMMAND', None) or os.environ.get('ASE_VASP_COMMAND', None)) is None):
                 print('Check cluster vasp settings')
                 sys.exit()
+        
         self.vasp_pp_path = os.environ['VASP_PP_PATH']
         self.vasp_command = os.environ.get('VASP_COMMAND', None) or os.environ.get('ASE_VASP_COMMAND', None)
 
     def assign_default_calculator(self):
-        """Sets a default calculator regadless of the structure type"""
+        """Sets a default calculator regardless of the structure type"""
         self.calc_default = Vasp(kpts=(1,1,1),
             potim=0.5,
             encut=520,
@@ -235,16 +247,24 @@ class KulTools:
     def run_dft(self,atoms,dir_name):
         atoms.calc = self.calc
         atoms.calc.set(**self.overall_vasp_params)
+        if atoms.calc.asdict()["inputs"]["xc"] == "R2SCAN":
+            atoms.calc.set(
+                gga=None,
+                # below values taken from https://github.com/awvwgk/r2scan-d4-paper?tab=readme-ov-file#functional-parameters
+                vdw_s8=0.78981345,
+                vdw_a1=0.49484001,
+                vdw_a2=5.73083694,
+                )
         #if self.calculation_type == 'opt' or self.calculation_type == 'vib':
         encut_for_dir = atoms.calc.float_params['encut']
         kpts_for_dir = ''.join([str(val) for val in atoms.calc.input_params['kpts']])
         func_for_dir = atoms.calc.input_params['xc']
         directory = dir_name + '_' + str(func_for_dir) + '_' + str(encut_for_dir) + '_' + str(kpts_for_dir)
-
         self._change_to_dir(directory)
+        # for key, value in atoms.calc.asdict()["inputs"].items():
+        #     print(f"{key} = {value}")
         energy = atoms.get_potential_energy() # Run vasp here
         os.chdir(self.working_dir)
-
         # Check for convergence after optimization
         #f = atoms.get_forces()
         #forces=np.sqrt(np.square(f[:,0]) +np.square(f[:,1]) + np.square(f[:,2]))
@@ -342,8 +362,7 @@ class KulTools:
         self.calc.set(nsw=100000,ibrion=0,tebeg=298, isif=2, smass=0)
         new_atoms = self.run_dft(atoms,dir_name)
         return new_atoms
-
-
+        
     def checkpoint(self, signum, _):
         print(f'Handling signal {signum} ({signal.Signals(signum).name}).')
         with open("STOPCAR", "w") as stopcar:
@@ -358,8 +377,6 @@ class KulTools:
         # os.system('scontrol update jobid=$SLURM_JOB_ID StartTime=now+1h')
         # os.system('sbatch --begin=now+120minutes -D={0} {1}'.format(root,sys.argv[0]))
         # os.system('sbatch --dependency=afterany:$SLURM_JOB_ID -D={0} {1}'.format(root,sys.argv[0]))
-
-
 
 #    if not 'solv-opt' in mode and not 'solv-spe' in mode:
 #            print('ERROR: Check mode')
@@ -411,8 +428,6 @@ class KulTools:
             atoms = opt(atoms,dir_name='solv-spe',nsw=0,lwave=False,lsol=True)
 
             os.chdir(cwd)
-
-
 
         # vibrations
         if 'vib' in mode  and 'ts' not in mode and 'isolated' not in mode:
